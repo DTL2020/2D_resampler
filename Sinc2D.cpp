@@ -236,11 +236,6 @@ void fill2DKernel(void)
 	/* Jinc weighted by Jinc - EWA Lanczos kernel */
 	for (i = 0; i < iKernelSize; i++)
 	{
-
-		if (i == (iKernelSize / 2))
-		{
-			int dbr = 0;
-		}
 		for (j = 0; j < iKernelSize; j++)
 		{
 			float fDist = sqrtf((float(iKernelSize / 2) - j) * (float(iKernelSize / 2) - j) + (float(iKernelSize / 2) - i) * (float(iKernelSize / 2) - i));
