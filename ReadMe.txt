@@ -4,3 +4,5 @@ Have optional performance test part. All options are switchable by comment in an
 
 It loads in.tif as input and outputs out.tif. 8 bit uncompessed. Processes only 1 (red) channel now.
 
+It requires VS2019 for build or any other C compiler with C17.0 math library with bessel_j function.
+
