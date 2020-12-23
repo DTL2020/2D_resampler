@@ -1,4 +1,4 @@
-Sinc and Jinc (EWA Lanczos and other) kernels processed by 2D convolution resampler. It is upsample only for now. It accepts 2 command line params:
+Sinc and Jinc (EWA Lanczos and other) kernels processed by 2D convolution resampler. It is upsample only for now. It accepts 2 command line params: integer upsanple ratio and number of taps for kernel.
 
 Have optional performance test part. All options are switchable by comment in and out parts of code before compile time only.
 
