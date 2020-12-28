@@ -15,7 +15,7 @@
 #include "stdlib.h"
 
 
-BYTE *g_pImageBuffer = 0, *g_pFilteredImageBuffer = 0;
+BYTE *g_pImageBuffer = 0, *g_pElImageBuffer, *g_pFilteredImageBuffer = 0;
 
 float *g_pfImageBuffer = 0, *g_pfFilteredImageBuffer = 0;
 
@@ -91,9 +91,7 @@ BOOL LoadTIFF8(void)
 	ZeroMemory(g_pFilteredImageBuffer, (iWidth * iHeight * iMul * iMul * 3));
 
 	g_pfImageBuffer = (float*)malloc(iWidth * iHeight * 3 * sizeof(float));
-	g_pfFilteredImageBuffer = (float*)malloc(iWidth * iHeight * iMul * iMul * 3 * sizeof(float));
-
-	ZeroMemory(g_pfFilteredImageBuffer, (iWidth * iHeight * iMul * iMul * 3));
+	ZeroMemory(g_pImageBuffer, (iWidth * iHeight * 3));
 
 
 	TIFFGetField(in_tiff, TIFFTAG_STRIPBYTECOUNTS, &bc);
@@ -117,6 +115,7 @@ BOOL LoadTIFF8(void)
 	TIFFGetField(in_tiff, TIFFTAG_ROWSPERSTRIP, &rowspstrip);
 
 	// load from tiff to temp buffer
+	int iBytesRead = 0;
 	for(row = 0; row < uiHeight; row+=rowspstrip)
 	{
 
@@ -124,8 +123,10 @@ BOOL LoadTIFF8(void)
 
 		if (row*uiWidth * 3 + stripsize > allstripsize) continue; // temp workaround, need allocate sumof(stripsize) mem
 
-		TIFFReadRawStrip(in_tiff, row/rowspstrip, &ucSrc_data[row*uiWidth*3], stripsize);
+		iBytesRead += TIFFReadRawStrip(in_tiff, row/rowspstrip, &ucSrc_data[row*uiWidth*3], stripsize);
 	}
+
+	printf("Read bytes from tiff %d , all image bytes must be %d\r\n", iBytesRead, iHeight*iWidth*3);
 
 	// separate planes
 	for(row=0; row < uiHeight; row++)
@@ -236,6 +237,11 @@ void fill2DKernel(void)
 	/* Jinc weighted by Jinc - EWA Lanczos kernel */
 	for (i = 0; i < iKernelSize; i++)
 	{
+
+		if (i == (iKernelSize / 2))
+		{
+			int dbr = 0;
+		}
 		for (j = 0; j < iKernelSize; j++)
 		{
 			float fDist = sqrtf((float(iKernelSize / 2) - j) * (float(iKernelSize / 2) - j) + (float(iKernelSize / 2) - i) * (float(iKernelSize / 2) - i));
@@ -303,20 +309,74 @@ void fill2DKernel(void)
 		}
 	}
 
+	// TO DO : 1. Make kernel half height. 2. Add run-length encoding for non-zero line length.
+
 }
 
 void KernelProc(void)
 {
 	int row,col, k_row,k_col;
-/*	// R-channel
-	for (row=0; row < iHeight; row++) // lines counter
+
+	int iWidthEl = iWidth + 2 * iKernelSize, iHeightEl = iHeight + 2 * iKernelSize;
+
+	g_pElImageBuffer = (BYTE*)malloc(iWidthEl * iHeightEl);
+	ZeroMemory(g_pElImageBuffer, iWidthEl * iHeightEl);
+
+	g_pfFilteredImageBuffer = (float*)malloc(iWidthEl * iHeightEl * iMul * iMul * sizeof(float));
+	ZeroMemory(g_pfFilteredImageBuffer, (iWidthEl * iHeightEl * iMul * iMul * sizeof(float)));
+
+	// R-channel
+
+	// fill center
+	for (row=0; row < iHeight; row++) 
 	{
 		for (col = 0; col < iWidth; col++)
 		{
-			g_pfImageBuffer[(row*iWidth + col)] = (float)g_pImageBuffer[(row*iWidth + col)]; // R channel
+			g_pElImageBuffer[(row + iKernelSize) * iWidthEl + (col + iKernelSize)] = g_pImageBuffer[(row*iWidth + col)]; // R channel
 		}		
 	}
 	
+	// fill upper strip - dup 1st line
+	for (row = 0; row < iKernelSize; row++) 
+	{
+		for (col = 0; col < iWidth; col++)
+		{
+			g_pElImageBuffer[row * iWidthEl + (col + iKernelSize)] = g_pImageBuffer[col]; // R channel
+		}
+	}
+	
+	/* somwhere bug here in to wr buffer
+	// fill lower strip - dup last line
+	for (row = iHeight; row < iHeightEl; row++) 
+	{
+		for (col = 0; col < iWidth; col++)
+		{
+			g_pElImageBuffer[(row + iKernelSize) * iWidthEl + (col + iKernelSize)] = g_pImageBuffer[((iHeight - 1) * iWidth + col)]; // R channel
+		}
+	}
+	*/
+//	printf("Just %d row of %d starting R-channel. Be patient...\r\n", row, iHeightEl);
+	
+	// fill left strip - dup first column
+	for (row = 0; row < iHeight; row++) 
+	{
+		for (col = 0; col < iKernelSize; col++)
+		{
+			g_pElImageBuffer[(row + iKernelSize) * iWidthEl + col] = g_pImageBuffer[(row * iWidth) + 0]; // R channel
+		}
+	}
+
+	// fill right strip - dup last column
+	for (row = 0; row < iHeight; row++) 
+	{
+		for (col = iWidth; col < (iWidth + iKernelSize); col++)
+		{
+			g_pElImageBuffer[(row + iKernelSize) * iWidthEl + col + iKernelSize] = g_pImageBuffer[(row * iWidth) + (iWidth - 1)]; // R channel
+		}
+	}
+	
+
+	/*
 	// 2d convolution pass - mul to kernel
 	for (row=0+iKernelSize/2; row < iHeight-iKernelSize/2; row++) // input lines counter
 	{
@@ -340,43 +400,44 @@ void KernelProc(void)
 	*/
 	
 	// 2d convolution pass - read kernel lut and add row to row
+	// process center 
 #pragma omp parallel for
-	for (row=0+iKernelSize/2; row < iHeight-iKernelSize/2; row++) // input lines counter
+	for (row=0+(iTaps); row < iHeightEl-(iTaps); row++) // input lines counter
 	{
-		for (col = 0+iKernelSize/2; col < iWidth-iKernelSize/2; col++) // input cols counter
+		for (col = 0+(iTaps); col < iWidthEl-(iTaps); col++) // input cols counter
 		{
-			UINT uiInpSample=g_pImageBuffer[(row*iWidth + col)]; // R-channel
+			UINT uiInpSample=g_pElImageBuffer[(row*iWidthEl + col)]; // R-channel
+
+			int iOutWidth = iWidthEl * iMul;
 
 			// fast skip zero
 			if (uiInpSample == 0) continue;
 
 			float* pfCurrKernel = g_pfKernel + ((uiInpSample - 1) * iKernelSize * iKernelSize);
 
-			float* pfFilteredImageBuffer = g_pfFilteredImageBuffer + (row * iMul - (iKernelSize / 2)) * iWidth * iMul + (col - (iKernelSize / 2)) * iMul;
+			float* pfFilteredImageBuffer = g_pfFilteredImageBuffer + ((row * iMul - (iKernelSize / 2)) * iOutWidth) + (col * iMul - (iKernelSize / 2));
 
 			for (k_row = 0; k_row < iKernelSize; k_row++)
 			{
-				// add full kernel row to output, cycle must be good SIMD compiled
+				// add full kernel row to output
 				for (k_col = 0; k_col < iKernelSize; k_col++)
 				{
 					pfFilteredImageBuffer[k_col] += pfCurrKernel[k_col];
 				} // k_col
-				pfFilteredImageBuffer += iWidth * iMul; // point to next start point in output buffer now
+				pfFilteredImageBuffer += iOutWidth; // point to next start point in output buffer now
 				pfCurrKernel += iKernelSize; // point to next kernel row now
 			} // k_row
 
 		} // col
-		//printf("Just %d row of %d done R-channel. Be patient...\r",row,iHeight);
 	} // row
-	
-	
+		
     // R-channel
-	for (row=0; row < iHeight * iMul; row++) // lines counter
+	for (row = 0 ; row < iHeight * iMul; row++) 
 	{
 		for (col = 0; col < iWidth * iMul; col++)
 		{
 			unsigned char ucVal;
-			float fVal = g_pfFilteredImageBuffer[(row*iWidth*iMul + col)]; // R channel
+			float fVal = g_pfFilteredImageBuffer[(row + iKernelSize*iMul)*iWidthEl*iMul + col + iKernelSize * iMul]; // R channel
 
 			fVal += 0.5f;
 
@@ -389,124 +450,14 @@ void KernelProc(void)
 				fVal = 0.0f;
 			}
 			ucVal = (unsigned char) fVal;
+
 			g_pFilteredImageBuffer[(row*iWidth*iMul + col)] = ucVal; // R channel
 			g_pFilteredImageBuffer[(iWidth*iHeight*iMul*iMul + row*iWidth*iMul + col)] = ucVal; //temp to G 
 			g_pFilteredImageBuffer[(iWidth*iHeight*2*iMul*iMul + row*iWidth*iMul + col)] = ucVal; //temp to B 
 		}		
 	}
 	
-	/*
-	// G-channel
-	for (row = 0; row < iHeight; row++) // lines counter
-	{
-		for (col = 0; col < iWidth; col++)
-		{
-			g_pfImageBuffer[(row*iWidth + col)] = (float)g_pImageBuffer[(iWidth*iHeight+ row*iWidth + col)]; // G channel
-		}
-	}
 
-	// 2d convolution pass
-	for (row = 0 + iKernelSize / 2; row < iHeight - iKernelSize / 2; row++) // input lines counter
-	{
-		for (col = 0 + iKernelSize / 2; col < iWidth - iKernelSize / 2; col++) // input cols counter
-		{
-			float fInpSample = g_pfImageBuffer[(row*iWidth + col)];
-
-			for (k_row = 0; k_row < iKernelSize; k_row++)
-			{
-				for (k_col = 0; k_col < iKernelSize; k_col++)
-				{
-					float fKrn = g_pfKernel[(k_row)*iKernelSize + k_col];
-
-					g_pfFilteredImageBuffer[(row*iMul - (iKernelSize / 2) + k_row)*iWidth*iMul + (col - (iKernelSize / 2))*iMul + k_col] += fInpSample*fKrn;
-				} // k_col
-			} // k_row
-
-		} // col
-		printf("Just %d row of %d done G-channel. Be patient...\r", row, iHeight);
-	} // row
-
-	// G-channel
-	for (row = 0; row < iHeight * iMul; row++) // lines counter
-	{
-		for (col = 0; col < iWidth * iMul; col++)
-		{
-			unsigned char ucVal;
-			float fVal = g_pfFilteredImageBuffer[(row*iWidth*iMul + col)]; 
-
-			fVal += 0.5f;
-
-			if (fVal > 255.0f)
-			{
-				fVal = 255.0f;
-			}
-			if (fVal < 0.0f)
-			{
-				fVal = 0.0f;
-			}
-			ucVal = (unsigned char)fVal;
-			//g_pFilteredImageBuffer[(row*iWidth*iMul + col)] = ucVal; // R channel
-				g_pFilteredImageBuffer[(iWidth*iHeight*iMul*iMul + row*iWidth*iMul + col)] = ucVal; // G channel 
-			//	g_pFilteredImageBuffer[(iWidth*iHeight*2*iMul*iMul + row*iWidth*iMul + col)] = ucVal; //temp to B 
-		}
-	}
-
-
-	// B-channel
-	for (row = 0; row < iHeight; row++) // lines counter
-	{
-		for (col = 0; col < iWidth; col++)
-		{
-			g_pfImageBuffer[(row*iWidth + col)] = (float)g_pImageBuffer[(iWidth*iHeight*2 + row*iWidth + col)]; // B channel
-		}
-	}
-
-	// 2d convolution pass
-	for (row = 0 + iKernelSize / 2; row < iHeight - iKernelSize / 2; row++) // input lines counter
-	{
-		for (col = 0 + iKernelSize / 2; col < iWidth - iKernelSize / 2; col++) // input cols counter
-		{
-			float fInpSample = g_pfImageBuffer[(row*iWidth + col)];
-
-			for (k_row = 0; k_row < iKernelSize; k_row++)
-			{
-				for (k_col = 0; k_col < iKernelSize; k_col++)
-				{
-					float fKrn = g_pfKernel[(k_row)*iKernelSize + k_col];
-
-					g_pfFilteredImageBuffer[(row*iMul - (iKernelSize / 2) + k_row)*iWidth*iMul + (col - (iKernelSize / 2))*iMul + k_col] += fInpSample*fKrn;
-				} // k_col
-			} // k_row
-
-		} // col
-		printf("Just %d row of %d done B-channel. Be patient...\r", row, iHeight);
-	} // row
-
-	// B-channel
-	for (row = 0; row < iHeight * iMul; row++) // lines counter
-	{
-		for (col = 0; col < iWidth * iMul; col++)
-		{
-			unsigned char ucVal;
-			float fVal = g_pfFilteredImageBuffer[(row*iWidth*iMul + col)];
-
-			fVal += 0.5f;
-
-			if (fVal > 255.0f)
-			{
-				fVal = 255.0f;
-			}
-			if (fVal < 0.0f)
-			{
-				fVal = 0.0f;
-			}
-			ucVal = (unsigned char)fVal;
-			//g_pFilteredImageBuffer[(row*iWidth*iMul + col)] = ucVal; // R channel
-			//g_pFilteredImageBuffer[(iWidth*iHeight*iMul*iMul + row*iWidth*iMul + col)] = ucVal; // G channel 
-			g_pFilteredImageBuffer[(iWidth*iHeight*2*iMul*iMul + row*iWidth*iMul + col)] = ucVal; // B channel 
-		}
-	}
-	*/
 }
 
 int main(int argc, char* argv[])
@@ -544,12 +495,14 @@ int main(int argc, char* argv[])
 	if (LoadTIFF8() == FALSE)
 		goto end;
 
-	KernelProc();
-/*
+	printf("Processing input w=%d h=%d\r\n", iWidth, iHeight);
+
+//	KernelProc();
+
 	// test perf
 // Measure Performance
 	printf("\n\nPerformance Measurement: \n");
-	int numIter = 10, iter;
+	int numIter = 5, iter;
 	LARGE_INTEGER proc_freq;
 	QueryPerformanceFrequency(&proc_freq);
 	LARGE_INTEGER startTime;
@@ -585,11 +538,12 @@ int main(int argc, char* argv[])
 
 	printf("\n min: %g max: %g avg: %g (msec?)\n", minval * 1000, maxval * 1000, average * 1000);
 	
-	*/
+	
 
 	SaveTIFF8();
 end:
 	free (g_pImageBuffer);
+	free(g_pElImageBuffer);
     free (g_pFilteredImageBuffer);
 
 	free (g_pfImageBuffer);
