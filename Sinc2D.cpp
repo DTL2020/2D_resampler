@@ -13,25 +13,42 @@
 
 #include "stdlib.h"
 
+#include <vector>
+#include <algorithm>
+
+using namespace std;
+
 enum Weighting
 {
     JINC,
     TRAPEZOIDAL
 };
 
+struct KrnRowUsefulRange
+{
+    int start_col, end_col;
+};
+
+KrnRowUsefulRange* pKrnRUR;
+
 Weighting Weighting_type = JINC;
 
-BYTE *g_pImageBuffer = 0, *g_pElImageBuffer, *g_pFilteredImageBuffer = 0;
+BYTE *g_pImageBuffer = 0, *g_pFilteredImageBuffer = 0;
 
-float *g_pfImageBuffer = 0, *g_pfFilteredImageBuffer = 0;
+float *g_pfImageBuffer = 0;// *g_pfFilteredImageBuffer = 0;
 
 float *g_pfKernel = 0;
 
 float *pfInpFloatRow = 0;
 
+std::vector<float*> fPointers;
+bool bfPointersFilled = false;
+
+float *pfFilteredCirculatingBuf = 0;
+
 int iKernelSize;
 int iMul = 4;
-int iTaps = 8;
+int iTaps = 4;
 
 int iWidth;
 int iHeight;
@@ -206,8 +223,7 @@ int SaveTIFF8()
 	return 0;
 
 }
-
-
+/*
 void ConvertiMulRowsToInt_c(int iInpWidth, int start_row, unsigned char* dst, int iDstStride)
 {
     for (int row = start_row; row < start_row + iMul; row++)
@@ -236,6 +252,39 @@ void ConvertiMulRowsToInt_c(int iInpWidth, int start_row, unsigned char* dst, in
         }
     }
 }
+*/
+void ConvertiMulRowsToInt_StartZero_c(int iInpWidth, int start_row, unsigned char* dst, int iDstStride)
+{
+	int row_float_buf_index = 0;
+    for (int row = start_row; row < start_row + iMul; row++)
+    {
+        for (int col = 0; col < iInpWidth * iMul; col++)
+        {
+            unsigned char ucVal;
+//            float fVal = ppfFilteredBufRowsPointers[row_float_buf_index][col + iKernelSize * iMul];
+			float fVal = fPointers[row_float_buf_index][col + iKernelSize * iMul];
+
+            fVal += 0.5f;
+
+            if (fVal > 255.0f)
+            {
+                fVal = 255.0f;
+            }
+            if (fVal < 0.0f)
+            {
+                fVal = 0.0f;
+            }
+            ucVal = (unsigned char)fVal;
+            dst[(row  * iDstStride + col)] = ucVal;
+//			g_pFilteredImageBuffer[(iWidth*iHeight*iMul*iMul + row*iWidth*iMul + col)] = ucVal; //temp to G 
+//			g_pFilteredImageBuffer[(iWidth*iHeight*2*iMul*iMul + row*iWidth*iMul + col)] = ucVal; //temp to B 
+			dst[(iWidth*iHeight*iMul*iMul + row * iDstStride + col)] = ucVal; // temp to G
+			dst[(iWidth*iHeight*iMul*iMul*2 + row * iDstStride + col)] = ucVal; // tempp to B
+        }
+		row_float_buf_index++;
+    }
+}
+
 
 void GetInpElRowAsFloat_c(int iInpRow, float* dst)
 {
@@ -382,12 +431,32 @@ void fill2DKernel(void)
 	}
 
 	// TO DO : 1. Make kernel half height. 2. Add run-length encoding for non-zero line length.
+	    // fill kernel row useful range table
+    for (i = 0; i < iKernelSize; i++)
+    {
+        bool bStarted = false;
+        for (j = 0; j < iKernelSize; j++)
+        {
+            float fDist2 = sqrtf((float(iKernelSize / 2) - j) * (float(iKernelSize / 2) - j) + (float(iKernelSize / 2) - i) * (float(iKernelSize / 2) - i));
+            if ((fDist2 <= iKernelSize / 2) && !bStarted)
+            {
+                pKrnRUR[i].start_col = j;
+                bStarted = true;
+            }
+            if ((fDist2 > iKernelSize / 2) && bStarted)
+            {
+                pKrnRUR[i].end_col = j - 1;
+                bStarted = false;
+            }
+        }
+        if (bStarted) pKrnRUR[i].end_col = iKernelSize;
+    }
 
 }
 
 void KernelProc_2_mul_cb(void)
 {
-	int row;
+	int row,i;
 
 	iWidthEl = iWidth + 2 * iKernelSize, iHeightEl = iHeight + 2 * iKernelSize;
 
@@ -399,16 +468,23 @@ void KernelProc_2_mul_cb(void)
     iCurrInpHeight = iHeight;
 	int iOutWidth = iWidthEl * iMul;
 
-	g_pfFilteredImageBuffer = (float*)malloc(iWidthEl * iHeightEl * iMul * iMul * sizeof(float));
-	ZeroMemory(g_pfFilteredImageBuffer, (iWidthEl * /*iHeightEl*/ iKernelSize * iMul * iMul * sizeof(float)));
+	ZeroMemory(pfFilteredCirculatingBuf, (iWidthEl * iKernelSize * iMul * sizeof(float)));
+
+	if (bfPointersFilled == false)
+	{
+		for (i = 0; i < iKernelSize; i++)
+		{
+			fPointers.push_back(pfFilteredCirculatingBuf + i * iOutWidth);
+		}
+		bfPointersFilled = true;
+	}
 
 	// R-channel
 	// 2d convolution pass - mul to kernel
     for (row = iTaps; row < iHeightEl - iTaps; row++) // input lines counter
     {
-		int col, k_row,k_col; // local for multithreading
+		int col, k_row, k_col; // local for multithreading
         // start all row-only dependent ptrs here
-        int iProcPtrRowStart = (row * iMul - (iKernelSize / 2)) * iOutWidth - (iKernelSize / 2);
 
         // prepare float32 pre-converted row data for each thread separately
 //        int tidx = omp_get_thread_num();
@@ -421,31 +497,35 @@ void KernelProc_2_mul_cb(void)
 
             float* pfCurrKernel_pos = g_pfKernel;
 
-            float* pfProc = g_pfFilteredImageBuffer + iProcPtrRowStart + col * iMul;
+			float* pfProc;// = ppfFilteredBufRowsPointers[0] + col * iMul;
 			
 			// start rows 
 			// mid rows - add to buf
             for (k_row = 0; k_row < iKernelSize - iMul; k_row++)
             {
-//                for (int k_col = pKrnRUR[k_row].start_col; k_col < pKrnRUR[k_row].end_col; k_col++)
+				pfProc = fPointers[k_row] + col * iMul;
+//                for (k_col = pKrnRUR[k_row].start_col; k_col < pKrnRUR[k_row].end_col; k_col++)
                 for (k_col = 0; k_col < iKernelSize; k_col++)
                 {
                     pfProc[k_col] += pfCurrKernel_pos[k_col] * fInpSample;
                 } // k_col 
-                pfProc += iOutWidth; // point to next start point in output buffer now
+
                 pfCurrKernel_pos += iKernelSize; // point to next kernel row now
+
             } // k_row
 
 			// last (new to proc) rows - zero load
             for (k_row = iKernelSize - iMul; k_row < iKernelSize; k_row++)
             {
-//                for (int k_col = pKrnRUR[k_row].start_col; k_col < pKrnRUR[k_row].end_col; k_col++)
+				pfProc = fPointers[k_row] + col * iMul;
+//                for (k_col = pKrnRUR[k_row].start_col; k_col < pKrnRUR[k_row].end_col; k_col++)
                 for (k_col = 0; k_col < iKernelSize; k_col++)
                 {
                     pfProc[k_col] = pfCurrKernel_pos[k_col] * fInpSample;
                 } // k_col 
-                pfProc += iOutWidth; // point to next start point in output buffer now
+
                 pfCurrKernel_pos += iKernelSize; // point to next kernel row now
+
             } // k_row
 
         } // col
@@ -454,8 +534,11 @@ void KernelProc_2_mul_cb(void)
 		//iMul rows ready - output result, skip iKernelSize+iTaps rows from beginning
 		if (iOutStartRow >= 0 && iOutStartRow < (iHeight - 1)*iMul)
 		{
-			ConvertiMulRowsToInt_c(iWidth, iOutStartRow, g_pFilteredImageBuffer, iWidth*iMul);
+			ConvertiMulRowsToInt_StartZero_c(iWidth, iOutStartRow, g_pFilteredImageBuffer, iWidth*iMul);
 		}
+
+		// circulate pointers to iMul rows upper
+		std::rotate(fPointers.begin(), fPointers.begin() + iMul, fPointers.end());
 
 	} // row
 }
@@ -487,11 +570,10 @@ int main(int argc, char* argv[])
 	// size of 2d kernel array iMul*iMul of KernelSize*KernelSize
 	// add kernel LUT for 8bit unsigned input
 	g_pfKernel = (float*)malloc(iKernelSize * iKernelSize * sizeof(float) * 256);
-
-
-	
-
 	ZeroMemory(g_pfKernel, iKernelSize * iKernelSize * sizeof(float) * 256);
+
+	pKrnRUR = new KrnRowUsefulRange[iKernelSize * sizeof(KrnRowUsefulRange)];
+    memset(pKrnRUR, 0, iKernelSize * sizeof(KrnRowUsefulRange));
 
 	fill2DKernel();
 
@@ -505,11 +587,13 @@ int main(int argc, char* argv[])
 
 	pfInpFloatRow = (float*)malloc((iWidth + iKernelSize * 2) * sizeof(float));
 
+	pfFilteredCirculatingBuf = (float*)malloc((iWidth + iKernelSize * 2) * iMul * (iKernelSize+1) * sizeof(float)); // iKernelSize rows, +1 looks like bug buf overrun somewhere ?
+
 	KernelProc_2_mul_cb();
-/*
+
 	// test perf
 // Measure Performance
-	printf("\n\nPerformance Measurement: \n");
+/*	printf("\n\nPerformance Measurement: \n");
 	int numIter = 5, iter;
 	LARGE_INTEGER proc_freq;
 	QueryPerformanceFrequency(&proc_freq);
@@ -524,7 +608,7 @@ int main(int argc, char* argv[])
 	{
 		QueryPerformanceCounter((LARGE_INTEGER*)&starttime);
 
-		KernelProc();
+		KernelProc_2_mul_cb();
 
 		QueryPerformanceCounter((LARGE_INTEGER*)&endtime);
 		endtime -= starttime;
@@ -545,7 +629,7 @@ int main(int argc, char* argv[])
 	average /= numIter;
 
 	printf("\n min: %g max: %g avg: %g (msec?)\n", minval * 1000, maxval * 1000, average * 1000);
-*/	
+*/
 	
 
 	SaveTIFF8();
@@ -555,11 +639,14 @@ int main(int argc, char* argv[])
     free (g_pFilteredImageBuffer);
 
 	free (g_pfImageBuffer);
-	free (g_pfFilteredImageBuffer);
+
+	free (pfFilteredCirculatingBuf);
 
 	free (g_pfKernel);
 
 	free (pfInpFloatRow);
+
+	delete pKrnRUR;
 
 	return 0;
 }
