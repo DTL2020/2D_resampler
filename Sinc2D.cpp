@@ -7,13 +7,19 @@
 #include "stdafx.h"
 #include "windows.h"
 #include "commctrl.h"
+#include "math.h"
 
 #include "tiffio.h"
 
-
-#include <cmath>
 #include "stdlib.h"
 
+enum Weighting
+{
+    JINC,
+    TRAPEZOIDAL
+};
+
+Weighting Weighting_type = JINC;
 
 BYTE *g_pImageBuffer = 0, *g_pElImageBuffer, *g_pFilteredImageBuffer = 0;
 
@@ -21,12 +27,19 @@ float *g_pfImageBuffer = 0, *g_pfFilteredImageBuffer = 0;
 
 float *g_pfKernel = 0;
 
+float *pfInpFloatRow = 0;
+
 int iKernelSize;
 int iMul = 4;
-int iTaps = 15;
+int iTaps = 8;
 
 int iWidth;
 int iHeight;
+
+int iWidthEl, iHeightEl;
+unsigned char* pCurr_src; // looks like bad but working way of transfer params of current call to GetInpElRowAsFloat.
+int iCurrSrcStrid; 
+int iCurrInpWidth, iCurrInpHeight;
 
 //-----------------------------------------------------------------------------
 // Msg: Display an error if needed
@@ -195,6 +208,62 @@ int SaveTIFF8()
 }
 
 
+void ConvertiMulRowsToInt_c(int iInpWidth, int start_row, unsigned char* dst, int iDstStride)
+{
+    for (int row = start_row; row < start_row + iMul; row++)
+    {
+        for (int col = 0; col < iInpWidth * iMul; col++)
+        {
+            unsigned char ucVal;
+            float fVal = g_pfFilteredImageBuffer[(row + iKernelSize * iMul) * iWidthEl * iMul + col + iKernelSize * iMul];
+
+            fVal += 0.5f;
+
+            if (fVal > 255.0f)
+            {
+                fVal = 255.0f;
+            }
+            if (fVal < 0.0f)
+            {
+                fVal = 0.0f;
+            }
+            ucVal = (unsigned char)fVal;
+            dst[(row  * iDstStride + col)] = ucVal;
+//			g_pFilteredImageBuffer[(iWidth*iHeight*iMul*iMul + row*iWidth*iMul + col)] = ucVal; //temp to G 
+//			g_pFilteredImageBuffer[(iWidth*iHeight*2*iMul*iMul + row*iWidth*iMul + col)] = ucVal; //temp to B 
+			dst[(iWidth*iHeight*iMul*iMul + row * iDstStride + col)] = ucVal; // temp to G
+			dst[(iWidth*iHeight*iMul*iMul*2 + row * iDstStride + col)] = ucVal; // tempp to B
+        }
+    }
+}
+
+void GetInpElRowAsFloat_c(int iInpRow, float* dst)
+{
+    int col;
+    // row range from iTaps to iHeightEl - iTaps - 1
+    // use iWidthEl and iHeightEl set in KernelRow()
+
+    if (iInpRow < iKernelSize) iInpRow = iKernelSize;
+    if (iInpRow > (iCurrInpHeight + iKernelSize - 1)) iInpRow = iCurrInpHeight + iKernelSize - 1;
+   
+    // start cols
+    for (col = 0; col < iKernelSize; col++) // left
+    {
+        dst[col] = (float)pCurr_src[((iInpRow - iKernelSize) * iCurrSrcStrid) + 0];
+    }
+    // mid cols
+    for (col = iKernelSize; col < iKernelSize + iCurrInpWidth; col++) // left
+    {
+        dst[col] = (float)pCurr_src[((iInpRow - iKernelSize) * iCurrSrcStrid) + (col - iKernelSize)];
+    } 
+    // end cols
+    for (col = iKernelSize + iCurrInpWidth; col < iWidthEl; col++) // right
+    {
+        dst[col] = (float)pCurr_src[((iInpRow - iKernelSize) * iCurrSrcStrid) + (iCurrInpWidth - 1)];
+    }
+}
+
+
 void fill2DKernel(void)
 {
 	float fPi = 3.14159265358979f;
@@ -255,16 +324,19 @@ void fill2DKernel(void)
 
 			if (fArg != 0)
 			{
-				float fBess = 2.0f * std::cyl_bessel_jf(1, fArg) / fArg;
-				float fW; // Jinc window
-				if (fArg_w != 0)
-				{
-					fW = 2.0f * std::cyl_bessel_jf(1, fArg_w) / fArg_w;
-				}
-				else
-				{
-					fW = 1.0f;
-				}
+                float fBess = 2.0f * (float)_j1(fArg) / fArg;
+                float fW; // Jinc window
+                if (Weighting_type == JINC)
+                {
+                     if (fArg_w != 0)
+                     {
+                         fW = 2.0f * (float)_j1(fArg_w) / fArg_w;
+                     }
+                     else
+                     {
+                         fW = 1.0f;
+                     }
+                }
 				
 				g_pfKernel[i * iKernelSize + j] = fBess * fW;
 			}
@@ -313,152 +385,81 @@ void fill2DKernel(void)
 
 }
 
-void KernelProc(void)
+void KernelProc_2_mul_cb(void)
 {
-	int row,col, k_row,k_col;
+	int row;
 
-	int iWidthEl = iWidth + 2 * iKernelSize, iHeightEl = iHeight + 2 * iKernelSize;
+	iWidthEl = iWidth + 2 * iKernelSize, iHeightEl = iHeight + 2 * iKernelSize;
 
-	g_pElImageBuffer = (BYTE*)malloc(iWidthEl * iHeightEl);
-	ZeroMemory(g_pElImageBuffer, iWidthEl * iHeightEl);
+	// current input plane sizes
+
+    pCurr_src = g_pImageBuffer;
+    iCurrSrcStrid = iWidth;//iSrcStride;
+    iCurrInpWidth = iWidth;
+    iCurrInpHeight = iHeight;
+	int iOutWidth = iWidthEl * iMul;
 
 	g_pfFilteredImageBuffer = (float*)malloc(iWidthEl * iHeightEl * iMul * iMul * sizeof(float));
-	ZeroMemory(g_pfFilteredImageBuffer, (iWidthEl * iHeightEl * iMul * iMul * sizeof(float)));
+	ZeroMemory(g_pfFilteredImageBuffer, (iWidthEl * /*iHeightEl*/ iKernelSize * iMul * iMul * sizeof(float)));
 
 	// R-channel
-
-	// fill center
-	for (row=0; row < iHeight; row++) 
-	{
-		for (col = 0; col < iWidth; col++)
-		{
-			g_pElImageBuffer[(row + iKernelSize) * iWidthEl + (col + iKernelSize)] = g_pImageBuffer[(row*iWidth + col)]; // R channel
-		}		
-	}
-	
-	// fill upper strip - dup 1st line
-	for (row = 0; row < iKernelSize; row++) 
-	{
-		for (col = 0; col < iWidth; col++)
-		{
-			g_pElImageBuffer[row * iWidthEl + (col + iKernelSize)] = g_pImageBuffer[col]; // R channel
-		}
-	}
-	
-	/* somwhere bug here in to wr buffer
-	// fill lower strip - dup last line
-	for (row = iHeight; row < iHeightEl; row++) 
-	{
-		for (col = 0; col < iWidth; col++)
-		{
-			g_pElImageBuffer[(row + iKernelSize) * iWidthEl + (col + iKernelSize)] = g_pImageBuffer[((iHeight - 1) * iWidth + col)]; // R channel
-		}
-	}
-	*/
-//	printf("Just %d row of %d starting R-channel. Be patient...\r\n", row, iHeightEl);
-	
-	// fill left strip - dup first column
-	for (row = 0; row < iHeight; row++) 
-	{
-		for (col = 0; col < iKernelSize; col++)
-		{
-			g_pElImageBuffer[(row + iKernelSize) * iWidthEl + col] = g_pImageBuffer[(row * iWidth) + 0]; // R channel
-		}
-	}
-
-	// fill right strip - dup last column
-	for (row = 0; row < iHeight; row++) 
-	{
-		for (col = iWidth; col < (iWidth + iKernelSize); col++)
-		{
-			g_pElImageBuffer[(row + iKernelSize) * iWidthEl + col + iKernelSize] = g_pImageBuffer[(row * iWidth) + (iWidth - 1)]; // R channel
-		}
-	}
-	
-
-	/*
 	// 2d convolution pass - mul to kernel
-	for (row=0+iKernelSize/2; row < iHeight-iKernelSize/2; row++) // input lines counter
-	{
-		for (col = 0+iKernelSize/2; col < iWidth-iKernelSize/2; col++) // input cols counter
+    for (row = iTaps; row < iHeightEl - iTaps; row++) // input lines counter
+    {
+		int col, k_row,k_col; // local for multithreading
+        // start all row-only dependent ptrs here
+        int iProcPtrRowStart = (row * iMul - (iKernelSize / 2)) * iOutWidth - (iKernelSize / 2);
+
+        // prepare float32 pre-converted row data for each thread separately
+//        int tidx = omp_get_thread_num();
+        float* pfInpRowSamplesFloatBufStart = pfInpFloatRow;// + tidx * iWidthEl;
+        GetInpElRowAsFloat_c(row, pfInpRowSamplesFloatBufStart);
+
+        for (col = iTaps; col < iWidthEl - iTaps; col++) // input cols counter
+        {
+            float fInpSample = pfInpRowSamplesFloatBufStart[col];
+
+            float* pfCurrKernel_pos = g_pfKernel;
+
+            float* pfProc = g_pfFilteredImageBuffer + iProcPtrRowStart + col * iMul;
+			
+			// start rows 
+			// mid rows - add to buf
+            for (k_row = 0; k_row < iKernelSize - iMul; k_row++)
+            {
+//                for (int k_col = pKrnRUR[k_row].start_col; k_col < pKrnRUR[k_row].end_col; k_col++)
+                for (k_col = 0; k_col < iKernelSize; k_col++)
+                {
+                    pfProc[k_col] += pfCurrKernel_pos[k_col] * fInpSample;
+                } // k_col 
+                pfProc += iOutWidth; // point to next start point in output buffer now
+                pfCurrKernel_pos += iKernelSize; // point to next kernel row now
+            } // k_row
+
+			// last (new to proc) rows - zero load
+            for (k_row = iKernelSize - iMul; k_row < iKernelSize; k_row++)
+            {
+//                for (int k_col = pKrnRUR[k_row].start_col; k_col < pKrnRUR[k_row].end_col; k_col++)
+                for (k_col = 0; k_col < iKernelSize; k_col++)
+                {
+                    pfProc[k_col] = pfCurrKernel_pos[k_col] * fInpSample;
+                } // k_col 
+                pfProc += iOutWidth; // point to next start point in output buffer now
+                pfCurrKernel_pos += iKernelSize; // point to next kernel row now
+            } // k_row
+
+        } // col
+
+		int iOutStartRow = (row - (iTaps + iKernelSize))*iMul;
+		//iMul rows ready - output result, skip iKernelSize+iTaps rows from beginning
+		if (iOutStartRow >= 0 && iOutStartRow < (iHeight - 1)*iMul)
 		{
-			float fInpSample=g_pfImageBuffer[(row*iWidth + col)];
+			ConvertiMulRowsToInt_c(iWidth, iOutStartRow, g_pFilteredImageBuffer, iWidth*iMul);
+		}
 
-			for (k_row = 0; k_row < iKernelSize; k_row++)
-			{
-				for (k_col = 0; k_col < iKernelSize; k_col++)
-				{
-					float fKrn = g_pfKernel[(k_row)*iKernelSize + k_col];
-					
-					g_pfFilteredImageBuffer[(row*iMul - (iKernelSize / 2) + k_row)*iWidth*iMul + (col - (iKernelSize / 2))*iMul + k_col] += fInpSample*fKrn;
-				} // k_col
-			} // k_row
-
-		} // col
-	//	printf("Just %d row of %d done R-channel. Be patient...\r",row,iHeight);
 	} // row
-	*/
-	
-	// 2d convolution pass - read kernel lut and add row to row
-	// process center 
-#pragma omp parallel for
-	for (row=0+(iTaps); row < iHeightEl-(iTaps); row++) // input lines counter
-	{
-		for (col = 0+(iTaps); col < iWidthEl-(iTaps); col++) // input cols counter
-		{
-			UINT uiInpSample=g_pElImageBuffer[(row*iWidthEl + col)]; // R-channel
-
-			int iOutWidth = iWidthEl * iMul;
-
-			// fast skip zero
-			if (uiInpSample == 0) continue;
-
-			float* pfCurrKernel = g_pfKernel + ((uiInpSample - 1) * iKernelSize * iKernelSize);
-
-			float* pfFilteredImageBuffer = g_pfFilteredImageBuffer + ((row * iMul - (iKernelSize / 2)) * iOutWidth) + (col * iMul - (iKernelSize / 2));
-
-			for (k_row = 0; k_row < iKernelSize; k_row++)
-			{
-				// add full kernel row to output
-				for (k_col = 0; k_col < iKernelSize; k_col++)
-				{
-					pfFilteredImageBuffer[k_col] += pfCurrKernel[k_col];
-				} // k_col
-				pfFilteredImageBuffer += iOutWidth; // point to next start point in output buffer now
-				pfCurrKernel += iKernelSize; // point to next kernel row now
-			} // k_row
-
-		} // col
-	} // row
-		
-    // R-channel
-	for (row = 0 ; row < iHeight * iMul; row++) 
-	{
-		for (col = 0; col < iWidth * iMul; col++)
-		{
-			unsigned char ucVal;
-			float fVal = g_pfFilteredImageBuffer[(row + iKernelSize*iMul)*iWidthEl*iMul + col + iKernelSize * iMul]; // R channel
-
-			fVal += 0.5f;
-
-			if (fVal > 255.0f) 
-			{
-				fVal= 255.0f;
-			}
-			if (fVal < 0.0f) 
-			{
-				fVal = 0.0f;
-			}
-			ucVal = (unsigned char) fVal;
-
-			g_pFilteredImageBuffer[(row*iWidth*iMul + col)] = ucVal; // R channel
-			g_pFilteredImageBuffer[(iWidth*iHeight*iMul*iMul + row*iWidth*iMul + col)] = ucVal; //temp to G 
-			g_pFilteredImageBuffer[(iWidth*iHeight*2*iMul*iMul + row*iWidth*iMul + col)] = ucVal; //temp to B 
-		}		
-	}
-	
-
 }
+
 
 int main(int argc, char* argv[])
 {
@@ -486,6 +487,8 @@ int main(int argc, char* argv[])
 	// size of 2d kernel array iMul*iMul of KernelSize*KernelSize
 	// add kernel LUT for 8bit unsigned input
 	g_pfKernel = (float*)malloc(iKernelSize * iKernelSize * sizeof(float) * 256);
+
+
 	
 
 	ZeroMemory(g_pfKernel, iKernelSize * iKernelSize * sizeof(float) * 256);
@@ -493,12 +496,17 @@ int main(int argc, char* argv[])
 	fill2DKernel();
 
 	if (LoadTIFF8() == FALSE)
-		goto end;
+	{
+		return 1;
+	}
+//		goto end;
 
 	printf("Processing input w=%d h=%d\r\n", iWidth, iHeight);
 
-//	KernelProc();
+	pfInpFloatRow = (float*)malloc((iWidth + iKernelSize * 2) * sizeof(float));
 
+	KernelProc_2_mul_cb();
+/*
 	// test perf
 // Measure Performance
 	printf("\n\nPerformance Measurement: \n");
@@ -537,19 +545,21 @@ int main(int argc, char* argv[])
 	average /= numIter;
 
 	printf("\n min: %g max: %g avg: %g (msec?)\n", minval * 1000, maxval * 1000, average * 1000);
-	
+*/	
 	
 
 	SaveTIFF8();
-end:
+//end:
 	free (g_pImageBuffer);
-	free(g_pElImageBuffer);
+
     free (g_pFilteredImageBuffer);
 
 	free (g_pfImageBuffer);
 	free (g_pfFilteredImageBuffer);
 
 	free (g_pfKernel);
+
+	free (pfInpFloatRow);
 
 	return 0;
 }
